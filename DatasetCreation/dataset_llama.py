@@ -6,12 +6,13 @@ import math
 from datasets import load_dataset, get_dataset_config_names
 from openai import OpenAI
 from tqdm import tqdm
-from dot_env import load_dotenv
+from dotenv import load_dotenv
 
 # --- 1. CONFIGURATION ---
+load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL_ID = "meta-llama/llama-4-maverick"
-OUTPUT_FILE = "scibench_results.jsonl"
+MODEL_ID = "meta-llama/Llama-3.3-70B-Instruct"
+OUTPUT_FILE = "scibench_results_llama-3.3.jsonl"
 
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
@@ -63,7 +64,7 @@ for subset in subsets:
         print(f"Skipping {subset}: {e}")
         continue
     
-    for i in tqdm(range(len(ds))):
+    for i in tqdm(range(411,len(ds))):
         row = ds[i]
         problem_id = str(row.get('problem_id', row.get('problemid', f"{subset}_{i}")))
         source = row.get('source', 'n/a')
@@ -73,7 +74,7 @@ for subset in subsets:
 
         prompt = (
             f"Problem (Subject: {subset}): {question}\n\n"
-            # f"Note: Provide answer in {unit}.\n"
+            f"Note: Provide answer in {unit}.\n"
             f"Solve step-by-step. End with: #### <number> for your final answer"
         )
 
@@ -82,10 +83,23 @@ for subset in subsets:
                 model=MODEL_ID,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
+                # logprobs=True,       # Enable logprobs
+                # top_logprobs=1       # Return the logprob for the most likely token
             )
 
             full_cot = response.choices[0].message.content
             token_count = response.usage.completion_tokens
+            
+            # Accessing the logprobs data
+            # This is a list of content objects containing token-level logprob data
+            # logprobs_data = response.choices[0].logprobs.content
+            
+            # # Example: Calculate average logprob for the entire generation
+            # # logprob values are ln(p), so we sum them and divide by length
+            # if logprobs_data:
+            #     avg_logprob = sum(lp.logprob for lp in logprobs_data) / len(logprobs_data)
+            # else:
+            #     avg_logprob = None
             
             # Regex for number extraction (including scientific notation)
             match = re.search(r'####\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)', full_cot)
