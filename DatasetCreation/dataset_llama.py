@@ -83,8 +83,8 @@ for subset in subsets:
                 model=MODEL_ID,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                # logprobs=True,       # Enable logprobs
-                # top_logprobs=1       # Return the logprob for the most likely token
+                logprobs=True,       # Enable logprobs
+                top_logprobs=1       # Return the logprob for the most likely token
             )
 
             full_cot = response.choices[0].message.content
@@ -92,14 +92,18 @@ for subset in subsets:
             
             # Accessing the logprobs data
             # This is a list of content objects containing token-level logprob data
-            # logprobs_data = response.choices[0].logprobs.content
+
+            logprobs_data = response.choices[0].logprobs.content
+            # --- LOGPROB EXTRACTION ---
+            # Extract raw logprob values for every token generated
+            raw_logprobs = [lp.logprob for lp in logprobs_data]
             
-            # # Example: Calculate average logprob for the entire generation
-            # # logprob values are ln(p), so we sum them and divide by length
-            # if logprobs_data:
-            #     avg_logprob = sum(lp.logprob for lp in logprobs_data) / len(logprobs_data)
-            # else:
-            #     avg_logprob = None
+            # Example: Calculate average logprob for the entire generation
+            # logprob values are ln(p), so we sum them and divide by length
+            if raw_logprobs:
+                avg_logprob = sum(raw_logprobs) / len(logprobs_data)
+            else:
+                avg_logprob = None
             
             # Regex for number extraction (including scientific notation)
             match = re.search(r'####\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)', full_cot)
@@ -114,12 +118,14 @@ for subset in subsets:
                 "source":source,
                 "unit": unit,
                 "problem_text": question,
-                "answer_number": true_answer,
                 "teacher_cot": full_cot,
                 "predicted_answer": predicted_val_str,
+                "actual_answer": true_answer,
                 "relative_difference": rel_diff, # NEW COLUMN
                 "output_tokens": token_count,
-                "is_correct": is_correct
+                "is_correct": is_correct,
+                "avg_logprob": avg_logprob,
+                "raw_logprobs": raw_logprobs,
             }
 
             with open(OUTPUT_FILE, 'a', encoding='utf-8') as f:
