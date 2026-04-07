@@ -8,6 +8,7 @@ model_name = "gpt2"
 print(f"Loading student model: {model_name}...")
 tokenizer, student_model = load_model(model_name)
 tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "left"
 print("Student model loaded.")
 
 print("Loading teacher model...")
@@ -65,8 +66,7 @@ trainer = KDTrainer(
     teacher_model=teacher_model,
     alpha=0.5,
     beta=0.3,
-    use_sequence_distill=True,
-    seq_kd=0.1,
+    use_sequence_distill=False,
     temperature=2.0
 )
 print("Trainer ready.")

@@ -22,7 +22,14 @@ class KDTrainer(Trainer):
         if self.teacher_model is not None:
             self.teacher_model.eval()
 
+    def _move_teacher_to_device(self, device):
+        if self.teacher_model is not None and next(self.teacher_model.parameters()).device != device:
+            self.teacher_model = self.teacher_model.to(device)
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        device = next(model.parameters()).device
+        self._move_teacher_to_device(device)
+
         labels = inputs["labels"]
         # Remove rationale_mask from inputs if it exists
         rationale_mask = inputs.pop("rationale_mask", None)
