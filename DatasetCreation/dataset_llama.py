@@ -11,8 +11,8 @@ from dotenv import load_dotenv
 # --- 1. CONFIGURATION ---
 load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL_ID = "meta-llama/Llama-3.3-70B-Instruct"
-OUTPUT_FILE = "scibench_results_llama-3.3.jsonl"
+MODEL_ID = "openai/gpt-oss-120b"
+OUTPUT_FILE = "scibench_results_gpt-oss-120b.jsonl"
 
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
@@ -64,7 +64,7 @@ for subset in subsets:
         print(f"Skipping {subset}: {e}")
         continue
     
-    for i in tqdm(range(411,len(ds))):
+    for i in tqdm(range(len(ds))):
         row = ds[i]
         problem_id = str(row.get('problem_id', row.get('problemid', f"{subset}_{i}")))
         source = row.get('source', 'n/a')
@@ -84,26 +84,33 @@ for subset in subsets:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 logprobs=True,       # Enable logprobs
-                top_logprobs=1       # Return the logprob for the most likely token
+                top_logprobs=1,       # Return the logprob for the most likely token
+                extra_body={
+                "provider": {
+                        "order": ["Cerebras"] # Only use these providers
+                    }
+                }
             )
-
+            # print(response.choices[0])
             full_cot = response.choices[0].message.content
             token_count = response.usage.completion_tokens
             
             # Accessing the logprobs data
             # This is a list of content objects containing token-level logprob data
-
-            logprobs_data = response.choices[0].logprobs.content
-            # --- LOGPROB EXTRACTION ---
-            # Extract raw logprob values for every token generated
-            raw_logprobs = [lp.logprob for lp in logprobs_data]
+            # --- SAFE LOGPROB EXTRACTION ---
+            raw_logprobs = None
+            avg_logprob = None
             
-            # Example: Calculate average logprob for the entire generation
-            # logprob values are ln(p), so we sum them and divide by length
-            if raw_logprobs:
-                avg_logprob = sum(raw_logprobs) / len(logprobs_data)
+            # In the OpenAI/OpenRouter SDK, logprobs is a ChoiceLogprobs object
+            # The actual list of token objects is in the .content attribute
+            if response.choices[0].logprobs and hasattr(response.choices[0].logprobs, 'content'):
+                content_list = response.choices[0].logprobs.content
+                if content_list:
+                    # Extract the logprob float from each ChatCompletionTokenLogprob object
+                    raw_logprobs = [lp.logprob for lp in content_list]
+                    avg_logprob = sum(raw_logprobs) / len(raw_logprobs)
             else:
-                avg_logprob = None
+                print(f"Warning: No logprobs content for problem {problem_id}")
             
             # Regex for number extraction (including scientific notation)
             match = re.search(r'####\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)', full_cot)
