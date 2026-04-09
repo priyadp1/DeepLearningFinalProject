@@ -45,4 +45,4 @@ def split_distillation_data(input_file, train_ratio=0.8):
     print(f" - {test_file} ({len(test_data)} records)")
 
 # Run the split
-split_distillation_data("scibench_results_gpt-oss-120b.jsonl")
+split_distillation_data("scibench_results_together_llama3.3.jsonl")

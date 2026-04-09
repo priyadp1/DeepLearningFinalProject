@@ -7,24 +7,25 @@ from datasets import load_dataset, get_dataset_config_names
 from openai import OpenAI
 from tqdm import tqdm
 from dotenv import load_dotenv
+from together import Together
 
 # --- 1. CONFIGURATION ---
 load_dotenv()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL_ID = "openai/gpt-oss-120b"
-OUTPUT_FILE = "scibench_results_gpt-oss-120b.jsonl"
+# Make sure you have TOGETHER_API_KEY in your .env file
+TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY") 
+MODEL_ID = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+OUTPUT_FILE = "scibench_results_together_llama3.3.jsonl"
 
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-)
+# Pointing directly to Together AI
+# client = OpenAI(
+#     base_url="https://api.together.xyz/v1",
+#     api_key=TOGETHER_API_KEY,
+# )
+
+client = Together()
 
 # --- 2. ENHANCED COMPARISON FUNCTION ---
 def get_numeric_metrics(pred_str, true_str, rel_tol=0.02, abs_tol=1e-5):
-    """
-    Returns (is_correct, relative_diff)
-    Handles signs, scientific notation, and rounding errors.
-    """
     def parse_value(s):
         if s is None: return None
         s = str(s).lower().replace(' ', '')
@@ -41,20 +42,16 @@ def get_numeric_metrics(pred_str, true_str, rel_tol=0.02, abs_tol=1e-5):
     if val_pred is None or val_true is None:
         return False, None
 
-    # Calculate Relative Difference
     if abs(val_true) > 1e-9:
         rel_diff = abs(val_pred - val_true) / abs(val_true)
     else:
-        # If true answer is 0, we use absolute difference
         rel_diff = abs(val_pred - val_true)
-    # distance <= max(rel_tol * max(abs(a),abs(b)),abs_tol)
-    is_correct = math.isclose(val_pred, val_true, rel_tol=rel_tol, abs_tol=abs_tol)
     
+    is_correct = math.isclose(val_pred, val_true, rel_tol=rel_tol, abs_tol=abs_tol)
     return is_correct, rel_diff
 
 # --- 3. PROCESSING LOOP ---
 subsets = get_dataset_config_names("xw27/scibench")
-print(subsets)
 
 for subset in subsets:
     print(f"\n Processing Subset: {subset}")
@@ -79,56 +76,70 @@ for subset in subsets:
         )
 
         try:
-            response = client.chat.completions.create(
-                model=MODEL_ID,
+            # response = client.chat.completions.create(
+            #     model=MODEL_ID,
+            #     messages=[{"role": "user", "content": prompt}],
+            #     temperature=0.1,
+            #     logprobs=True,       
+            #     # top_logprobs is required by Together when logprobs=True
+            #     # If set to 1, it returns the logprob for the chosen token
+            #     top_logprobs=1       
+            # )
+
+
+            completion = client.chat.completions.create(
+                model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                logprobs=True,       # Enable logprobs
-                top_logprobs=1,       # Return the logprob for the most likely token
-                extra_body={
-                "provider": {
-                        "order": ["Cerebras"] # Only use these providers
-                    }
-                }
+                # In Together SDK, logprobs=1 returns the logprob for the chosen token
+                logprobs=1 
             )
-            # print(response.choices[0])
-            full_cot = response.choices[0].message.content
-            token_count = response.usage.completion_tokens
-            
-            # Accessing the logprobs data
-            # This is a list of content objects containing token-level logprob data
-            # --- SAFE LOGPROB EXTRACTION ---
+            # print(completion)
+            full_cot = completion.choices[0].message.content
+            # --- TOGETHER SDK LOGPROB EXTRACTION ---
+            # The structure differs slightly from the OpenAI response object
             raw_logprobs = None
             avg_logprob = None
-            
-            # In the OpenAI/OpenRouter SDK, logprobs is a ChoiceLogprobs object
-            # The actual list of token objects is in the .content attribute
-            if response.choices[0].logprobs and hasattr(response.choices[0].logprobs, 'content'):
-                content_list = response.choices[0].logprobs.content
-                if content_list:
-                    # Extract the logprob float from each ChatCompletionTokenLogprob object
-                    raw_logprobs = [lp.logprob for lp in content_list]
+
+            if hasattr(completion.choices[0], 'logprobs') and completion.choices[0].logprobs:
+                # Together returns a list of logprobs for each token
+                token_logprobs = completion.choices[0].logprobs.token_ids
+                # And the actual probability values are here:
+                raw_logprobs = completion.choices[0].logprobs.token_logprobs
+                
+                if raw_logprobs:
                     avg_logprob = sum(raw_logprobs) / len(raw_logprobs)
-            else:
-                print(f"Warning: No logprobs content for problem {problem_id}")
+            token_count = completion.usage.completion_tokens
+            # full_cot = response.choices[0].message.content
+            # token_count = response.usage.completion_tokens
             
-            # Regex for number extraction (including scientific notation)
+            # # --- SAFE LOGPROB EXTRACTION ---
+            # raw_logprobs = None
+            # avg_logprob = None
+            # print("LOGPROBS\n")
+            # print(response)
+            
+            # # Extraction logic for Together's OpenAI-compatible response
+            # if response.choices[0].logprobs and hasattr(response.choices[0].logprobs, 'content'):
+            #     content_list = response.choices[0].logprobs.content
+            #     if content_list:
+            #         raw_logprobs = [lp.logprob for lp in content_list]
+            #         avg_logprob = sum(raw_logprobs) / len(raw_logprobs)
+            
             match = re.search(r'####\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)', full_cot)
             predicted_val_str = match.group(1) if match else None
 
-            # Calculate metrics
             is_correct, rel_diff = get_numeric_metrics(predicted_val_str, true_answer)
 
-            # --- 4. CONSTRUCT RECORD ---
             record = {
                 "problemid": problem_id,
-                "source":source,
+                "source": source,
                 "unit": unit,
                 "problem_text": question,
                 "teacher_cot": full_cot,
                 "predicted_answer": predicted_val_str,
                 "actual_answer": true_answer,
-                "relative_difference": rel_diff, # NEW COLUMN
+                "relative_difference": rel_diff,
                 "output_tokens": token_count,
                 "is_correct": is_correct,
                 "avg_logprob": avg_logprob,
@@ -142,4 +153,4 @@ for subset in subsets:
             print(f"Error at {subset} index {i}: {e}")
             continue
 
-print(f"\n Done! Data with error metrics saved to {OUTPUT_FILE}")
+print(f"\n Done! Data saved to {OUTPUT_FILE}")
