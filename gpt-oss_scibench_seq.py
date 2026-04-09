@@ -4,17 +4,18 @@ from kd_trainer import KDTrainer
 from model import load_model
 import json
 
-student_model_name = "meta-llama/Llama-3.2-1B-Instruct"
+student_model_name = "mistralai/Mistral-7B-v0.3"
 print(f"Loading student model: {student_model_name}...")
 tokenizer, student_model = load_model(student_model_name)
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
-teacher_model_name = "meta-llama/Llama-3.3-70B-Instruct"
+teacher_model_name = "openai/gpt-oss-120b"
 print(f"Loading teacher model: {teacher_model_name}...")
 teacher_model = AutoModelForCausalLM.from_pretrained(
     teacher_model_name,
     device_map="auto",
-    torch_dtype=torch.bfloat16
+    torch_dtype=torch.bfloat16,
+    load_in_4bit=True,
 )
 print("Models loaded.")
 
@@ -56,7 +57,7 @@ def tokenize_scibench_dataset(tokenizer, data, seq_length=512):
     encodings["labels"] = labels
     return encodings
 
-raw_dataset = tokenize_scibench_dataset(tokenizer, read_scibench_data("DatasetCreation/scibench_results_llama-3.3_train.jsonl"))
+raw_dataset = tokenize_scibench_dataset(tokenizer, read_scibench_data("DatasetCreation/scibench_results_gpt-oss-120b_train.jsonl"))
 
 class Wrapper(torch.utils.data.Dataset):
     def __init__(self, encodings):
@@ -73,7 +74,7 @@ print(f"Dataset wrapped: {len(wrapped_dataset)} samples.")
 
 print("Setting up training arguments...")
 training_args = TrainingArguments(
-    output_dir="./results_llama_logit",
+    output_dir="./results_gpt_sequence",
     num_train_epochs=3,
     per_device_train_batch_size=2,
     learning_rate=2e-5,
@@ -90,12 +91,13 @@ trainer = KDTrainer(
     teacher_model=teacher_model,
     alpha=0.5,
     beta=0.0,
-    use_sequence_distill=False,
+    use_sequence_distill=True,
+    seq_kd=0.1,
     temperature=2.0
 )
 
 print("Starting training...")
 trainer.train()
-trainer.save_model("./llama_scibench_logit_kd_model")
+trainer.save_model("./gpt_oss_scibench_sequence_kd_model")
 
 

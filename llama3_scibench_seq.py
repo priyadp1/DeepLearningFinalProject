@@ -1,4 +1,3 @@
-import os
 import torch
 from transformers import AutoModelForCausalLM, TrainingArguments
 from kd_trainer import KDTrainer
@@ -15,7 +14,7 @@ print(f"Loading teacher model: {teacher_model_name}...")
 teacher_model = AutoModelForCausalLM.from_pretrained(
     teacher_model_name,
     device_map="auto",
-    dtype=torch.bfloat16,
+    torch_dtype=torch.bfloat16,
     load_in_4bit=True,
 )
 print("Models loaded.")
@@ -75,7 +74,7 @@ print(f"Dataset wrapped: {len(wrapped_dataset)} samples.")
 
 print("Setting up training arguments...")
 training_args = TrainingArguments(
-    output_dir="./results_sequence",
+    output_dir="./results_llama_sequence",
     num_train_epochs=3,
     per_device_train_batch_size=2,
     learning_rate=2e-5,
@@ -99,5 +98,6 @@ trainer = KDTrainer(
 
 print("Starting training...")
 trainer.train()
+trainer.save_model("./llama_scibench_sequence_kd_model")
 
 
