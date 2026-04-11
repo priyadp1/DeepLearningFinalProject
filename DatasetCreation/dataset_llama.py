@@ -1,30 +1,25 @@
 import os
 import re
-import sys
 import json
 import math
+import argparse
 from datasets import load_dataset, get_dataset_config_names
 from openai import OpenAI
 from tqdm import tqdm
 from dotenv import load_dotenv
-from together import Together
 
 # --- 1. CONFIGURATION ---
 load_dotenv()
-# Make sure you have TOGETHER_API_KEY in your .env file
-TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY") 
-MODEL_ID = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
-OUTPUT_FILE = "scibench_results_together_llama3.3.jsonl"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY") 
+MODEL_ID = "meta-llama/llama-3.3-70b-instruct"
 
-# Pointing directly to Together AI
-# client = OpenAI(
-#     base_url="https://api.together.xyz/v1",
-#     api_key=TOGETHER_API_KEY,
-# )
 
-client = Together()
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
 
-# --- 2. ENHANCED COMPARISON FUNCTION ---
+# --- 2. NUMERIC EVALUATION ---
 def get_numeric_metrics(pred_str, true_str, rel_tol=0.02, abs_tol=1e-5):
     def parse_value(s):
         if s is None: return None
@@ -35,6 +30,10 @@ def get_numeric_metrics(pred_str, true_str, rel_tol=0.02, abs_tol=1e-5):
             return float(match.group()) if match else None
         except (ValueError, AttributeError):
             return None
+
+    # Handle exact matches for Booleans/Strings (common in TheoremQA)
+    if str(pred_str).lower().strip() == str(true_str).lower().strip():
+        return True, 0.0
 
     val_pred = parse_value(pred_str)
     val_true = parse_value(true_str)
@@ -50,107 +49,94 @@ def get_numeric_metrics(pred_str, true_str, rel_tol=0.02, abs_tol=1e-5):
     is_correct = math.isclose(val_pred, val_true, rel_tol=rel_tol, abs_tol=abs_tol)
     return is_correct, rel_diff
 
-# --- 3. PROCESSING LOOP ---
-subsets = get_dataset_config_names("xw27/scibench")
+# --- 3. CORE PROCESSING FUNCTION ---
+def run_benchmark(dataset_type):
+    output_file = f"{dataset_type}_{f"llama" if "llama-3.3-70B" in MODEL_ID else "gpt-oss-120b"}_openrouter.jsonl"
+    print(f"Starting benchmark: {dataset_type}")
 
-for subset in subsets:
-    print(f"\n Processing Subset: {subset}")
-    try:
-        ds = load_dataset("xw27/scibench", subset, split="train")
-    except Exception as e:
-        print(f"Skipping {subset}: {e}")
-        continue
-    
-    for i in tqdm(range(len(ds))):
-        row = ds[i]
-        problem_id = str(row.get('problem_id', row.get('problemid', f"{subset}_{i}")))
-        source = row.get('source', 'n/a')
-        unit = row.get('unit', 'n/a')
-        question = row['problem_text']
-        true_answer = str(row['answer_number'])
+    # Prepare data based on flag
+    items = []
+    if dataset_type == "scibench":
+        subsets = get_dataset_config_names("xw27/scibench")
+        for sub in subsets:
+            ds = load_dataset("xw27/scibench", sub, split="train")
+            for row in ds:
+                items.append({
+                    "problem_id": str(row.get('problem_id', row.get('problemid'))),
+                    "source": row.get('source', 'n/a'),
+                    "unit": row.get('unit', 'n/a'),
+                    "problem_text": row['problem_text'],
+                    "answer_number": str(row['answer_number']),
+                    "subset": sub
+                })
+    else:  # TheoremQA
+        ds = load_dataset("TIGER-Lab/TheoremQA", split="test")
+        for i, row in enumerate(ds):
+            items.append({
+                "problem_id": str(row.get('id', i)),
+                "source": "TheoremQA",
+                "unit": row.get('Answer_type', 'n/a'),
+                "problem_text": row['Question'],
+                "answer_number": str(row['Answer']),
+                "subset": "theoremqa"
+            })
 
+    for item in tqdm(items):
         prompt = (
-            f"Problem (Subject: {subset}): {question}\n\n"
-            f"Note: Provide answer in {unit}.\n"
+            f"Problem (Subject: {item['subset']}): {item['problem_text']}\n\n"
+            f"Note: Provide answer in {item['unit']}.\n"
             f"Solve step-by-step. End with: #### <number> for your final answer"
         )
 
         try:
-            # response = client.chat.completions.create(
-            #     model=MODEL_ID,
-            #     messages=[{"role": "user", "content": prompt}],
-            #     temperature=0.1,
-            #     logprobs=True,       
-            #     # top_logprobs is required by Together when logprobs=True
-            #     # If set to 1, it returns the logprob for the chosen token
-            #     top_logprobs=1       
-            # )
-
-
-            completion = client.chat.completions.create(
-                model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            response = client.chat.completions.create(
+                model=MODEL_ID,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                # In Together SDK, logprobs=1 returns the logprob for the chosen token
-                logprobs=1 
+                # logprobs=True # Logits logic enabled
             )
-            # print(completion)
-            full_cot = completion.choices[0].message.content
-            # --- TOGETHER SDK LOGPROB EXTRACTION ---
-            # The structure differs slightly from the OpenAI response object
-            raw_logprobs = None
-            avg_logprob = None
-
-            if hasattr(completion.choices[0], 'logprobs') and completion.choices[0].logprobs:
-                # Together returns a list of logprobs for each token
-                token_logprobs = completion.choices[0].logprobs.token_ids
-                # And the actual probability values are here:
-                raw_logprobs = completion.choices[0].logprobs.token_logprobs
-                
-                if raw_logprobs:
-                    avg_logprob = sum(raw_logprobs) / len(raw_logprobs)
-            token_count = completion.usage.completion_tokens
-            # full_cot = response.choices[0].message.content
-            # token_count = response.usage.completion_tokens
             
-            # # --- SAFE LOGPROB EXTRACTION ---
-            # raw_logprobs = None
+            full_cot = response.choices[0].message.content
+            token_count = response.usage.completion_tokens
+            
+            # --- LOGPROB EXTRACTION ---
             # avg_logprob = None
-            # print("LOGPROBS\n")
-            # print(response)
+            # raw_logprobs = None
+            # if response.choices[0].logprobs and response.choices[0].logprobs.content:
+            #     raw_logprobs = [lp.logprob for lp in response.choices[0].logprobs.content]
+            #     avg_logprob = sum(raw_logprobs) / len(raw_logprobs)
             
-            # # Extraction logic for Together's OpenAI-compatible response
-            # if response.choices[0].logprobs and hasattr(response.choices[0].logprobs, 'content'):
-            #     content_list = response.choices[0].logprobs.content
-            #     if content_list:
-            #         raw_logprobs = [lp.logprob for lp in content_list]
-            #         avg_logprob = sum(raw_logprobs) / len(raw_logprobs)
-            
-            match = re.search(r'####\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)', full_cot)
-            predicted_val_str = match.group(1) if match else None
+            # Match number or capture string for TheoremQA flexibility
+            match = re.search(r'####\s*(.*)', full_cot)
+            predicted_val_str = match.group(1).strip() if match else None
 
-            is_correct, rel_diff = get_numeric_metrics(predicted_val_str, true_answer)
+            is_correct, rel_diff = get_numeric_metrics(predicted_val_str, item['answer_number'])
 
+            # SCHEMA: Matching your original requested fields
             record = {
-                "problemid": problem_id,
-                "source": source,
-                "unit": unit,
-                "problem_text": question,
+                "problemid": item['problem_id'],
+                "source": item['source'],
+                "unit": item['unit'],
+                "problem_text": item['problem_text'],
                 "teacher_cot": full_cot,
                 "predicted_answer": predicted_val_str,
-                "actual_answer": true_answer,
+                "actual_answer": item['answer_number'],
                 "relative_difference": rel_diff,
                 "output_tokens": token_count,
                 "is_correct": is_correct,
-                "avg_logprob": avg_logprob,
-                "raw_logprobs": raw_logprobs,
+                # "avg_logprob": avg_logprob,
+                # "raw_logprobs": raw_logprobs,
             }
 
-            with open(OUTPUT_FILE, 'a', encoding='utf-8') as f:
+            with open(output_file, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(record) + '\n')
 
         except Exception as e:
-            print(f"Error at {subset} index {i}: {e}")
+            print(f"Error processing {item['problem_id']}: {e}")
             continue
 
-print(f"\n Done! Data saved to {OUTPUT_FILE}")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", choices=["scibench", "theoremqa"], default="scibench")
+    args = parser.parse_args()
+    run_benchmark(args.dataset)
