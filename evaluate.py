@@ -54,6 +54,7 @@ def answers_match(predicted, actual, tolerance=0.01):
 
 def extract_reasoning(response):
     """Extract the reasoning steps from the response, if present."""
+    response = response.strip()
     if "####" in response:
         cleaned_response = response.split("####")[0].strip()
         return cleaned_response
@@ -96,8 +97,9 @@ def evaluate_model(model, tokenizer, records, device, max_new_tokens):
         predicted_answer = extract_answer(response)
         actual_answer = str(r["actual_answer"]).strip()
         match = answers_match(predicted_answer, actual_answer)
+        actual_reasoning = r.get("teacher_cot", "").strip()
         predicted_reasoning = extract_reasoning(response)
-        bert_scores = reasoning_match(predicted_reasoning, r.get("teacher_cot", ""))
+        bert_scores = reasoning_match(predicted_reasoning, actual_reasoning)
         correct += int(match)
 
         results.append({
