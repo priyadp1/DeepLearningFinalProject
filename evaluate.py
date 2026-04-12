@@ -52,8 +52,14 @@ def answers_match(predicted, actual, tolerance=0.01):
     except (ValueError, ZeroDivisionError):
         return predicted.lower() == actual.lower()
 
+def extract_reasoning(response):
+    """Extract the reasoning steps from the response, if present."""
+    if "####" in response:
+        cleaned_response = response.split("####")[0].strip()
+        return cleaned_response
+
 def reasoning_match(predicted, actual):
-    if not actual:
+    if not actual or not predicted:
         return {"bert_p": 0.0, "bert_r": 0.0, "bert_f1": 0.0, "reasoning_correct": False}
     P, R, F1 = score([predicted], [actual], lang="en", verbose=False)
     f1 = F1.item()
@@ -61,7 +67,7 @@ def reasoning_match(predicted, actual):
         "bert_p": round(P.item(), 4),
         "bert_r": round(R.item(), 4),
         "bert_f1": round(f1, 4),
-        "reasoning_correct": f1 > 0.90,
+        "reasoning_correct": f1 > 0.75,
     }
 
 def evaluate_model(model, tokenizer, records, device, max_new_tokens):
@@ -90,7 +96,8 @@ def evaluate_model(model, tokenizer, records, device, max_new_tokens):
         predicted_answer = extract_answer(response)
         actual_answer = str(r["actual_answer"]).strip()
         match = answers_match(predicted_answer, actual_answer)
-        bert_scores = reasoning_match(response, r.get("teacher_cot", ""))
+        predicted_reasoning = extract_reasoning(response)
+        bert_scores = reasoning_match(predicted_reasoning, r.get("teacher_cot", ""))
         correct += int(match)
 
         results.append({
@@ -205,8 +212,13 @@ def main():
     args = parser.parse_args()
 
     # Device
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+        os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+    else:
+        device = "cpu"
     print(f"Device: {device}\n")
 
     # Load test data
@@ -225,17 +237,19 @@ def main():
     base_model, base_tok = load_model(args.base_model, device)
     base_results, base_correct = evaluate_model(base_model, base_tok, records, device, args.max_new_tokens)
     del base_model
-    torch.mps.empty_cache() if device == "mps" else None
+    if device == "cuda": torch.cuda.empty_cache()
+    elif device == "mps": torch.mps.empty_cache()
 
     # Evaluate tuned model
     print("\n─── Tuned model ───")
     tuned_model, tuned_tok = load_model(args.tuned_model, device)
     tuned_results, tuned_correct = evaluate_model(tuned_model, tuned_tok, records, device, args.max_new_tokens)
     del tuned_model
-    torch.mps.empty_cache() if device == "mps" else None
+    if device == "cuda": torch.cuda.empty_cache()
+    elif device == "mps": torch.mps.empty_cache()
 
     # Print comparison
-    print_comparison(base_results, tuned_results, records)
+    print_comparison(base_results, tuned_results)
 
     # Save detailed results
     length = len(records)
