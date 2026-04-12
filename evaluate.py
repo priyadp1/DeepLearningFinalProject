@@ -58,6 +58,7 @@ def extract_reasoning(response):
     if "####" in response:
         cleaned_response = response.split("####")[0].strip()
         return cleaned_response
+    return response
 
 def reasoning_match(predicted, actual):
     if not actual or not predicted:
