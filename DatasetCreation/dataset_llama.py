@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 # --- 1. CONFIGURATION ---
 load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY") 
-MODEL_ID = "meta-llama/llama-3.3-70b-instruct"
+MODEL_ID = "openai/gpt-oss-120b"
 
 
 client = OpenAI(
@@ -51,7 +51,7 @@ def get_numeric_metrics(pred_str, true_str, rel_tol=0.02, abs_tol=1e-5):
 
 # --- 3. CORE PROCESSING FUNCTION ---
 def run_benchmark(dataset_type):
-    output_file = f"{dataset_type}_{f"llama" if "llama-3.3-70B" in MODEL_ID else "gpt-oss-120b"}_openrouter.jsonl"
+    output_file = f"{dataset_type}_{f"llama" if "llama-3.3-70b" in MODEL_ID else "gpt-oss-120b"}_openrouter.jsonl"
     print(f"Starting benchmark: {dataset_type}")
 
     # Prepare data based on flag
