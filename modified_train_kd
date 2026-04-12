@@ -1,0 +1,523 @@
+"""
+train_kd.py — Knowledge distillation for math/science reasoning.
+
+Two modes:
+  sequence  — train student to reproduce teacher's CoT + answer (offline)
+  logit     — same as sequence, PLUS live API calls to get top-k logprobs
+              for offline KL divergence distillation
+
+Supports multiple datasets (e.g. scibench + theoremqa) combined.
+
+Usage (sequence distillation):
+    python train_kd.py \
+        --mode sequence \
+        --student_model "meta-llama/Llama-3.1-8B-Instruct" \
+        --datasets scibench_train.jsonl theoremqa_train.jsonl \
+        --output_dir "./kd_seq"
+
+Usage (logit distillation with live API):
+    python train_kd.py \
+        --mode logit \
+        --student_model "meta-llama/Llama-3.1-8B-Instruct" \
+        --datasets scibench_train.jsonl theoremqa_train.jsonl \
+        --api_base "http://localhost:1234/v1" \
+        --api_model "your-teacher-model" \
+        --top_k 20 \
+        --output_dir "./kd_logit"
+"""
+
+import argparse
+import json
+import os
+import sys
+import torch
+from datasets import Dataset
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TrainingArguments,
+)
+
+from kd_trainer import KDTrainer
+from api_logprobs import LogprobFetcher, convert_topk_to_ids
+
+try:
+    from peft import LoraConfig, get_peft_model, TaskType
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
+
+
+# ── 1. Load JSON / JSONL ────────────────────────────────────────────
+def load_json_data(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".jsonl":
+        records = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return records
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return [data]
+    raise ValueError(f"Unexpected JSON structure in {path}")
+
+
+def load_multiple_datasets(paths, filter_correct=True):
+    """Load and merge multiple dataset files, tagging each with its source file."""
+    all_records = []
+    for path in paths:
+        records = load_json_data(path)
+        basename = os.path.splitext(os.path.basename(path))[0]
+        for r in records:
+            r["_dataset_source"] = basename
+        print(f"  {basename}: {len(records)} records")
+        all_records.extend(records)
+
+    if filter_correct:
+        before = len(all_records)
+        all_records = [r for r in all_records if r.get("is_correct", True)]
+        print(f"  Filtered to correct: {before} → {len(all_records)}")
+
+    return all_records
+
+
+# ── 2. Format records ──────────────────────────────────────────────
+def format_row(row):
+    prompt = (
+        f"Solve the following problem step by step.\n\n"
+        f"Problem: {row['problem_text'].strip()}"
+    )
+    rationale = row["teacher_cot"].strip()
+    answer = str(row["predicted_answer"]).strip()
+    completion = f"{rationale}\n\n#### {answer}"
+    return {
+        "prompt": prompt,
+        "completion": completion,
+        "rationale": rationale,
+        "dataset_source": row.get("_dataset_source", "unknown"),
+    }
+
+
+# ── 3. Fetch top-k logprobs from API ───────────────────────────────
+def fetch_logprobs_for_records(records, fetcher, tokenizer, top_k):
+    """
+    Call the API for each record to get top-k logprobs.
+    Enriches records in-place with topk_tokens and topk_logprobs.
+    Returns count of successes and failures.
+    """
+    success, failed = 0, 0
+    total = len(records)
+
+    for i, r in enumerate(records):
+        prompt = (
+            f"Solve the following problem step by step.\n\n"
+            f"Problem: {r['problem_text'].strip()}"
+        )
+        try:
+            _, topk_tokens, topk_logprobs = fetcher.fetch(prompt)
+            if topk_tokens is None:
+                print(f"  [{i+1}/{total}] No logprobs returned — skipping")
+                r["topk_tokens"] = None
+                r["topk_logprobs"] = None
+                failed += 1
+                continue
+
+            # Convert token strings → student tokenizer IDs
+            r["topk_token_ids"] = convert_topk_to_ids(topk_tokens, tokenizer, top_k)
+            r["topk_logprobs"] = topk_logprobs
+            r["topk_tokens"] = topk_tokens  # keep for debugging
+            success += 1
+
+        except Exception as e:
+            print(f"  [{i+1}/{total}] API error: {e}")
+            r["topk_token_ids"] = None
+            r["topk_logprobs"] = None
+            failed += 1
+
+        if (i + 1) % 25 == 0:
+            print(f"  [{i+1}/{total}] fetched={success} failed={failed}")
+
+    print(f"  Logprob fetch complete: {success} ok, {failed} failed")
+    # Remove records where API failed
+    records[:] = [r for r in records if r.get("topk_token_ids") is not None]
+    return success, failed
+
+
+# ── 4. Tokenise and build masks ────────────────────────────────────
+def tokenize_fn(examples, tokenizer, max_seq_len, has_topk=False):
+    prompts = examples["prompt"]
+    completions = examples["completion"]
+    rationales = examples["rationale"]
+
+    out = {
+        "input_ids": [], "labels": [], "attention_mask": [],
+        "rationale_mask": [],
+    }
+    if has_topk:
+        out["topk_token_ids"] = []
+        out["topk_logprobs"] = []
+
+    for idx in range(len(prompts)):
+        prompt = prompts[idx]
+        completion = completions[idx]
+        rationale = rationales[idx]
+
+        prompt_toks = tokenizer(prompt, add_special_tokens=True)
+        full_text = prompt + "\n" + completion
+        full_toks = tokenizer(full_text, add_special_tokens=True,
+                              truncation=True, max_length=max_seq_len)
+
+        input_ids = full_toks["input_ids"]
+        attn_mask = full_toks["attention_mask"]
+        prompt_len = len(prompt_toks["input_ids"])
+
+        labels = [-100] * prompt_len + input_ids[prompt_len:]
+
+        rat_prefix = "\n" + rationale
+        rat_toks = tokenizer(rat_prefix, add_special_tokens=False)
+        rat_end = prompt_len + len(rat_toks["input_ids"])
+
+        rationale_mask = [0] * len(input_ids)
+        for i in range(prompt_len, min(rat_end, len(input_ids))):
+            rationale_mask[i] = 1
+
+        out["input_ids"].append(input_ids)
+        out["labels"].append(labels)
+        out["attention_mask"].append(attn_mask)
+        out["rationale_mask"].append(rationale_mask)
+
+        if has_topk:
+            topk_ids = examples["topk_token_ids"][idx]
+            topk_lps = examples["topk_logprobs"][idx]
+            k = len(topk_ids[0]) if topk_ids else 0
+            comp_len = len(input_ids) - prompt_len
+
+            # Truncate or pad to match completion length
+            if len(topk_ids) >= comp_len:
+                topk_ids = topk_ids[:comp_len]
+                topk_lps = topk_lps[:comp_len]
+            else:
+                pad_n = comp_len - len(topk_ids)
+                topk_ids = topk_ids + [[0] * k] * pad_n
+                topk_lps = topk_lps + [[0.0] * k] * pad_n
+
+            # Prepend zeros for prompt positions
+            topk_ids = [[0] * k] * prompt_len + topk_ids
+            topk_lps = [[0.0] * k] * prompt_len + topk_lps
+            out["topk_token_ids"].append(topk_ids)
+            out["topk_logprobs"].append(topk_lps)
+
+    return out
+
+
+# ── 5. Collator ────────────────────────────────────────────────────
+class KDDataCollator:
+    def __init__(self, tokenizer, max_seq_len, has_topk=False):
+        self.pad_id = tokenizer.pad_token_id
+        self.max_seq_len = max_seq_len
+        self.has_topk = has_topk
+
+    def __call__(self, features):
+        max_len = min(max(len(f["input_ids"]) for f in features), self.max_seq_len)
+
+        batch = {"input_ids": [], "attention_mask": [], "labels": [], "rationale_mask": []}
+        if self.has_topk:
+            batch["topk_token_ids"] = []
+            batch["topk_logprobs"] = []
+
+        for f in features:
+            # Truncate then pad to max_len
+            ids = f["input_ids"][:max_len]
+            attn = f["attention_mask"][:max_len]
+            lab = f["labels"][:max_len]
+            rmask = f["rationale_mask"][:max_len]
+
+            pad = max_len - len(ids)
+            batch["input_ids"].append(ids + [self.pad_id] * pad)
+            batch["attention_mask"].append(attn + [0] * pad)
+            batch["labels"].append(lab + [-100] * pad)
+            batch["rationale_mask"].append(rmask + [0] * pad)
+
+            if self.has_topk:
+                k = len(f["topk_token_ids"][0])
+                tk_ids = f["topk_token_ids"][:max_len]
+                tk_lps = f["topk_logprobs_k"][:max_len]
+                batch["topk_token_ids"].append(tk_ids + [[0]*k]*pad)
+                batch["topk_logprobs"].append(tk_lps + [[0.0]*k]*pad)
+
+        result = {
+            "input_ids": torch.tensor(batch["input_ids"]),
+            "attention_mask": torch.tensor(batch["attention_mask"]),
+            "labels": torch.tensor(batch["labels"]),
+            "rationale_mask": torch.tensor(batch["rationale_mask"]),
+        }
+        if self.has_topk:
+            result["topk_token_ids"] = torch.tensor(batch["topk_token_ids"]).long()
+            result["topk_logprobs"] = torch.tensor(batch["topk_logprobs"]).float()
+        return result
+
+
+# ── 6. Main ─────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        description="Knowledge distillation trainer — sequence or logit mode"
+    )
+
+    # Mode
+    parser.add_argument("--mode", type=str, required=True, choices=["sequence", "logit"],
+                        help="'sequence' = train on teacher CoT text | "
+                             "'logit' = same + live API top-k KL divergence")
+
+    # Models
+    parser.add_argument("--student_model", type=str, required=True,
+                        help="HuggingFace model name (e.g. meta-llama/Llama-3.1-8B-Instruct)")
+
+    # Data — accepts multiple files
+    parser.add_argument("--datasets", type=str, nargs="+", required=True,
+                        help="One or more .json/.jsonl dataset files")
+    parser.add_argument("--output_dir", type=str, default="./kd_output")
+    parser.add_argument("--filter_correct", action="store_true", default=True)
+
+    # API (logit mode only)
+    parser.add_argument("--api_base", type=str, default="http://localhost:1234/v1",
+                        help="OpenAI-compatible API base URL")
+    parser.add_argument("--api_model", type=str, default=None,
+                        help="Model name to use in API calls")
+    parser.add_argument("--api_key", type=str, default=None)
+    parser.add_argument("--top_k", type=int, default=20,
+                        help="Number of top logprobs to fetch per token")
+    parser.add_argument("--api_max_tokens", type=int, default=600)
+    parser.add_argument("--api_delay", type=float, default=0.5,
+                        help="Delay between API calls in seconds")
+
+    # Training hyperparams
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--grad_accum", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--max_seq_len", type=int, default=1024)
+
+    # KD weights
+    parser.add_argument("--alpha", type=float, default=0.5,
+                        help="Weight for answer CE loss")
+    parser.add_argument("--beta", type=float, default=0.3,
+                        help="Weight for rationale CE loss")
+    parser.add_argument("--temperature", type=float, default=2.0,
+                        help="Temperature for KL divergence (logit mode)")
+    parser.add_argument("--topk_kd_weight", type=float, default=0.2,
+                        help="Weight for top-k KL loss (logit mode)")
+    # LoRA
+    parser.add_argument("--use_lora", action="store_true", default=False,
+                        help="Use LoRA for parameter-efficient training (much less memory)")
+    parser.add_argument("--lora_r", type=int, default=16,
+                        help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=32,
+                        help="LoRA alpha scaling")
+    parser.add_argument("--lora_dropout", type=float, default=0.05,
+                        help="LoRA dropout")
+    args = parser.parse_args()
+
+    # ── Validate ──
+    if args.mode == "logit" and args.api_model is None:
+        parser.error("--api_model is required when --mode=logit")
+
+    # ── Device ──
+    if torch.backends.mps.is_available():
+        device = "mps"
+        print("✓ Using Apple MPS backend")
+    else:
+        device = "cpu"
+        print("⚠ MPS not available, falling back to CPU")
+    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
+    # ── Load + merge datasets ──
+    print(f"\nLoading {len(args.datasets)} dataset(s)...")
+    records = load_multiple_datasets(args.datasets, args.filter_correct)
+    print(f"  Total: {len(records)} records\n")
+
+    required = {"problem_text", "teacher_cot", "predicted_answer"}
+    missing = required - set(records[0].keys())
+    if missing:
+        raise ValueError(f"Records missing required keys: {missing}")
+
+    # ── Tokenizer ──
+    print(f"Loading student: {args.student_model}")
+    tokenizer = AutoTokenizer.from_pretrained(args.student_model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # ── Logit mode: fetch top-k from API ──
+    has_topk = False
+    if args.mode == "logit":
+        print(f"\n📡 Fetching top-{args.top_k} logprobs from {args.api_base}")
+        print(f"   Model: {args.api_model}")
+        print(f"   This will make {len(records)} API calls...\n")
+
+        fetcher = LogprobFetcher(
+            api_base=args.api_base,
+            model=args.api_model,
+            top_k=args.top_k,
+            max_tokens=args.api_max_tokens,
+            api_key=args.api_key,
+            delay=args.api_delay,
+        )
+        ok, fail = fetch_logprobs_for_records(records, fetcher, tokenizer, args.top_k)
+
+        if len(records) == 0:
+            print("ERROR: No records left after API fetch. Check API connection.")
+            sys.exit(1)
+
+        has_topk = True
+        print(f"  Proceeding with {len(records)} records\n")
+
+    # ── Format ──
+    formatted = [format_row(r) for r in records]
+    if has_topk:
+        for fmt, rec in zip(formatted, records):
+            fmt["topk_token_ids"] = rec["topk_token_ids"]
+            fmt["topk_logprobs"] = rec["topk_logprobs"]
+
+    dataset = Dataset.from_list(formatted)
+
+    # ── Tokenise ──
+    cols_to_remove = [c for c in dataset.column_names if c != "topk_token_ids" and c != "topk_logprobs"]
+    tokenized = dataset.map(
+        lambda ex: tokenize_fn(ex, tokenizer, args.max_seq_len, has_topk=has_topk),
+        batched=True,
+        remove_columns=cols_to_remove,
+    )
+    split = tokenized.train_test_split(test_size=0.05, seed=42)
+    print(f"  Train: {len(split['train'])}  |  Eval: {len(split['test'])}")
+
+    # ── Print mode summary ──
+    if args.mode == "sequence":
+        print(f"\n📋 Mode: SEQUENCE distillation")
+        print(f"   Loss = {args.alpha}·answer + {args.beta}·rationale")
+        print(f"   (remaining {1.0 - args.alpha - args.beta:.1f} weight unused — no teacher model)\n")
+    else:
+        print(f"\n📋 Mode: LOGIT distillation (offline top-{args.top_k} KL)")
+        print(f"   Loss = {args.alpha}·answer + {args.beta}·rationale "
+              f"+ {args.topk_kd_weight}·top-k KL")
+        print(f"   Temperature: {args.temperature}\n")
+
+    # ── Model ──
+    model = AutoModelForCausalLM.from_pretrained(
+        args.student_model, torch_dtype=torch.float32,
+    )
+    params = sum(p.numel() for p in model.parameters()) / 1e9
+    print(f"  Student: {params:.1f}B parameters")
+
+    # ── LoRA ──
+    if args.use_lora:
+        if not PEFT_AVAILABLE:
+            raise ImportError("LoRA requires the `peft` package. Run: pip install peft")
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"],
+        )
+        model = get_peft_model(model, lora_config)
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        print(f"  LoRA enabled: {trainable/1e6:.1f}M trainable / {total/1e9:.1f}B total "
+              f"({100*trainable/total:.2f}%)")
+    else:
+        print(f"  Full fine-tuning (use --use_lora to reduce memory)")
+
+    # ── Training args ──
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        learning_rate=args.lr,
+        weight_decay=0.01,
+        warmup_ratio=0.05,
+        logging_steps=10,
+        eval_strategy="steps",
+        eval_steps=100,
+        save_strategy="steps",
+        save_steps=200,
+        save_total_limit=2,
+        gradient_checkpointing=True,
+        bf16=False,
+        fp16=False,
+        dataloader_pin_memory=False,
+        report_to="none",
+        remove_unused_columns=False,
+        load_best_model_at_end=True,
+    )
+
+    # ── Trainer ──
+    trainer = KDTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=split["train"],
+        eval_dataset=split["test"],
+        data_collator=KDDataCollator(tokenizer, args.max_seq_len, has_topk=has_topk),
+        teacher_model=None,  # no live teacher — API-based instead
+        alpha=args.alpha,
+        beta=args.beta,
+        temperature=args.temperature,
+        use_topk_distill=has_topk,
+        topk_kd_weight=args.topk_kd_weight,
+    )
+
+    # ── Train ──
+    print("\n🚀 Starting training...\n")
+    trainer.train()
+
+    # ── Save ──
+    final_path = os.path.join(args.output_dir, "final")
+    print(f"\nSaving model to {final_path}")
+
+    if args.use_lora:
+        # Save LoRA adapters
+        model.save_pretrained(final_path)
+        tokenizer.save_pretrained(final_path)
+        # Also save a merged version for easy inference
+        merged_path = os.path.join(args.output_dir, "merged")
+        print(f"Merging LoRA weights into base model → {merged_path}")
+        merged = model.merge_and_unload()
+        merged.save_pretrained(merged_path)
+        tokenizer.save_pretrained(merged_path)
+    else:
+        trainer.save_model(final_path)
+        tokenizer.save_pretrained(final_path)
+
+    # Save config for reproducibility
+    config = {
+        "mode": args.mode,
+        "student_model": args.student_model,
+        "datasets": args.datasets,
+        "alpha": args.alpha,
+        "beta": args.beta,
+        "temperature": args.temperature,
+        "topk_kd_weight": args.topk_kd_weight if args.mode == "logit" else None,
+        "top_k": args.top_k if args.mode == "logit" else None,
+        "api_model": args.api_model if args.mode == "logit" else None,
+        "epochs": args.epochs,
+        "lr": args.lr,
+        "batch_size": args.batch_size,
+        "grad_accum": args.grad_accum,
+        "max_seq_len": args.max_seq_len,
+    }
+    with open(os.path.join(args.output_dir, "train_config.json"), "w") as f:
+        json.dump(config, f, indent=2)
+
+    print("✓ Done!")
+
+
+if __name__ == "__main__":
+    main()
