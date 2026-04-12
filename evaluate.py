@@ -1,15 +1,3 @@
-"""
-evaluate.py — Compare base vs fine-tuned student on a test JSONL.
-
-Usage:
-    python evaluate.py \
-        --base_model "Qwen/Qwen2.5-0.5B-Instruct" \
-        --tuned_model "./kd_scibench/final" \
-        --test_data "scibench_results_gpt-oss-120b_test.jsonl" \
-        --max_new_tokens 400 \
-        --output "eval_results.json"
-"""
-
 import argparse
 import json
 import os
@@ -17,6 +5,7 @@ import re
 import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from bert_score import score
 
 
 def load_model(path, device):
@@ -63,6 +52,17 @@ def answers_match(predicted, actual, tolerance=0.01):
     except (ValueError, ZeroDivisionError):
         return predicted.lower() == actual.lower()
 
+def reasoning_match(predicted, actual):
+    if not actual:
+        return {"bert_p": 0.0, "bert_r": 0.0, "bert_f1": 0.0, "reasoning_correct": False}
+    P, R, F1 = score([predicted], [actual], lang="en", verbose=False)
+    f1 = F1.item()
+    return {
+        "bert_p": round(P.item(), 4),
+        "bert_r": round(R.item(), 4),
+        "bert_f1": round(f1, 4),
+        "reasoning_correct": f1 > 0.90,
+    }
 
 def evaluate_model(model, tokenizer, records, device, max_new_tokens):
     results = []
@@ -87,17 +87,19 @@ def evaluate_model(model, tokenizer, records, device, max_new_tokens):
         if response.startswith(prompt):
             response = response[len(prompt):].strip()
 
-        predicted = extract_answer(response)
-        actual = str(r["actual_answer"]).strip()
-        match = answers_match(predicted, actual)
+        predicted_answer = extract_answer(response)
+        actual_answer = str(r["actual_answer"]).strip()
+        match = answers_match(predicted_answer, actual_answer)
+        bert_scores = reasoning_match(response, r.get("teacher_cot", ""))
         correct += int(match)
 
         results.append({
             "problemid": r.get("problemid", f"problem_{i}"),
             "source": r.get("source", ""),
-            "predicted": predicted,
-            "actual": actual,
+            "predicted": predicted_answer,
+            "actual": actual_answer,
             "correct": match,
+            **bert_scores,
             "generation_time": round(elapsed, 2),
             "response": response,
         })
@@ -108,7 +110,7 @@ def evaluate_model(model, tokenizer, records, device, max_new_tokens):
     return results, correct
 
 
-def print_comparison(base_results, tuned_results, records):
+def print_comparison(base_results, tuned_results):
     """Side-by-side comparison table."""
     print("\n" + "=" * 80)
     print(f"{'Problem':<20} {'Actual':>10} {'Base':>10} {'Tuned':>10} {'Base':>6} {'Tuned':>6}")
@@ -145,10 +147,23 @@ def print_comparison(base_results, tuned_results, records):
     b_time = sum(r["generation_time"] for r in base_results)
     t_time = sum(r["generation_time"] for r in tuned_results)
 
+    b_avg_f1 = sum(r["bert_f1"] for r in base_results) / n
+    t_avg_f1 = sum(r["bert_f1"] for r in tuned_results) / n
+    b_avg_r = sum(r["bert_r"] for r in base_results) / n
+    t_avg_r = sum(r["bert_r"] for r in tuned_results) / n
+    b_avg_p = sum(r["bert_p"] for r in base_results) / n
+    t_avg_p = sum(r["bert_p"] for r in tuned_results) / n
+    b_reasoning = sum(1 for r in base_results if r["reasoning_correct"])
+    t_reasoning = sum(1 for r in tuned_results if r["reasoning_correct"])
+
     print("=" * 80)
     print(f"\n{'METRIC':<30} {'BASE':>15} {'TUNED':>15}")
     print("-" * 60)
     print(f"{'Accuracy':<30} {b_correct}/{n} ({100*b_correct/n:.1f}%){'':<3} {t_correct}/{n} ({100*t_correct/n:.1f}%)")
+    print(f"{'Reasoning Correct':<30} {b_reasoning}/{n} ({100*b_reasoning/n:.1f}%){'':<3} {t_reasoning}/{n} ({100*t_reasoning/n:.1f}%)")
+    print(f"{'Avg BERTScore F1':<30} {b_avg_f1:>15.4f} {t_avg_f1:>15.4f}")
+    print(f"{'Avg BERTScore Recall':<30} {b_avg_r:>15.4f} {t_avg_r:>15.4f}")
+    print(f"{'Avg BERTScore Precision':<30} {b_avg_p:>15.4f} {t_avg_p:>15.4f}")
     print(f"{'Total gen time':<30} {b_time:>12.1f}s {t_time:>12.1f}s")
     print(f"{'Avg time per problem':<30} {b_time/n:>12.2f}s {t_time/n:>12.2f}s")
     print()
@@ -223,12 +238,21 @@ def main():
     print_comparison(base_results, tuned_results, records)
 
     # Save detailed results
+    length = len(records)
     output = {
         "base_model": args.base_model,
         "tuned_model": args.tuned_model,
-        "test_size": len(records),
-        "base_accuracy": base_correct / len(records),
-        "tuned_accuracy": tuned_correct / len(records),
+        "test_size": length,
+        "base_accuracy": base_correct / length,
+        "tuned_accuracy": tuned_correct / length,
+        "base_reasoning_correct": sum(1 for r in base_results if r["reasoning_correct"]) / length,
+        "tuned_reasoning_correct": sum(1 for r in tuned_results if r["reasoning_correct"]) / length,
+        "base_avg_bert_f1": sum(r["bert_f1"] for r in base_results) / length,
+        "tuned_avg_bert_f1": sum(r["bert_f1"] for r in tuned_results) / length,
+        "base_avg_bert_r": sum(r["bert_r"] for r in base_results) / length,
+        "tuned_avg_bert_r": sum(r["bert_r"] for r in tuned_results) / length,
+        "base_avg_bert_p": sum(r["bert_p"] for r in base_results) / length,
+        "tuned_avg_bert_p": sum(r["bert_p"] for r in tuned_results) / length,
         "base_results": base_results,
         "tuned_results": tuned_results,
     }

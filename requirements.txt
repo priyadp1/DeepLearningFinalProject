@@ -2,3 +2,5 @@ accelerate
 transformers
 datasets
 torch
+sentence-transformers
+bert-score
