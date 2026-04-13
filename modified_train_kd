@@ -1,31 +1,3 @@
-"""
-train_kd.py — Knowledge distillation for math/science reasoning.
-
-Two modes:
-  sequence  — train student to reproduce teacher's CoT + answer (offline)
-  logit     — same as sequence, PLUS live API calls to get top-k logprobs
-              for offline KL divergence distillation
-
-Supports multiple datasets (e.g. scibench + theoremqa) combined.
-
-Usage (sequence distillation):
-    python train_kd.py \
-        --mode sequence \
-        --student_model "meta-llama/Llama-3.1-8B-Instruct" \
-        --datasets scibench_train.jsonl theoremqa_train.jsonl \
-        --output_dir "./kd_seq"
-
-Usage (logit distillation with live API):
-    python train_kd.py \
-        --mode logit \
-        --student_model "meta-llama/Llama-3.1-8B-Instruct" \
-        --datasets scibench_train.jsonl theoremqa_train.jsonl \
-        --api_base "http://localhost:1234/v1" \
-        --api_model "your-teacher-model" \
-        --top_k 20 \
-        --output_dir "./kd_logit"
-"""
-
 import argparse
 import json
 import os

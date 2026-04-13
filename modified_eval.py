@@ -1,36 +1,12 @@
-"""Evaluate distilled student models on SciBench and TheoremQA test sets.
-
-Produces two output files per run:
-  1. **responses.jsonl** — one record per test problem, matching the input
-     JSONL schema (with student_cot replacing teacher_cot).
-  2. **metrics.json**   — accuracy and BERTScore statistics per dataset and
-     overall.
-
-Usage
------
-    python evaluate.py \
-        --adapter-path ./output/gpt_seq/final \
-        --base-model   meta-llama/Llama-3.2-3B-Instruct \
-        --teacher-dir  gpt_teacher_data \
-        --output-dir   ./eval_results/gpt_seq
-
-    # Evaluate all three distilled models in sequence:
-    python evaluate.py --adapter-path ./output/gpt_seq/final   --teacher-dir gpt_teacher_data   --output-dir ./eval_results/gpt_seq
-    python evaluate.py --adapter-path ./output/llama_seq/final --teacher-dir llama_teacher_data --output-dir ./eval_results/llama_seq
-    python evaluate.py --adapter-path ./output/llama_logit/final --teacher-dir llama_teacher_data --output-dir ./eval_results/llama_logit
-"""
-
 import argparse
 import json
 import os
 import re
 import statistics
-
 import torch
 from bert_score import score as bert_score_fn
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
 from dataset import load_jsonl
 from model import get_device, get_dtype
 
@@ -180,6 +156,8 @@ def parse_args():
     p.add_argument("--max-new-tokens", type=int, default=512)
     p.add_argument("--tolerance", type=float, default=0.05,
                     help="Relative tolerance for numeric answer comparison")
+    p.add_argument("--eval-student-model", action="store_true",
+                    help="Also evaluate the student model (no LoRA) as a no-KD baseline")
     return p.parse_args()
 
 
@@ -223,6 +201,48 @@ def evaluate_dataset(model, tokenizer, test_data, device, max_new_tokens, tolera
 
     return records, student_cots, teacher_cots
 
+def evaluate_student_model(student_model_name, datasets, dtype, device, max_new_tokens, tolerance):
+    print(f"  Loading student model: {student_model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(student_model_name)
+    model = AutoModelForCausalLM.from_pretrained(student_model_name, torch_dtype=dtype).to(device)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    model.eval()
+
+    all_records, all_s_cots, all_t_cots = [], [], []
+    dataset_metrics = {}
+
+    for ds_name, test_data in datasets.items():
+        print(f"\n  [{ds_name}] ({len(test_data)} problems)")
+        records, s_cots, t_cots = evaluate_dataset(
+            model, tokenizer, test_data, device, max_new_tokens, tolerance
+        )
+        all_records.extend(records)
+        all_s_cots.extend(s_cots)
+        all_t_cots.extend(t_cots)
+
+        correct = sum(1 for r in records if r["is_correct"])
+        total = len(records)
+        accuracy = correct / total if total else 0.0
+        print(f"  {ds_name} accuracy: {correct}/{total} = {accuracy:.3f}")
+        print(f"  Computing BERTScores for {ds_name} …")
+        bs = compute_bert_scores(s_cots, t_cots, device)
+
+        dataset_metrics[ds_name] = {
+            "total": total,
+            "correct": correct,
+            "accuracy": round(accuracy, 4),
+            "bert_score": {k: v for k, v in bs.items() if k != "per_item"},
+        }
+
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps":
+        torch.mps.empty_cache()
+
+    return all_records, all_s_cots, all_t_cots, dataset_metrics
+
 
 def main():
     args = parse_args()
@@ -234,7 +254,7 @@ def main():
     print(f"Loading base model: {args.base_model}")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     base_model = AutoModelForCausalLM.from_pretrained(
-        args.base_model, dtype=dtype,
+        args.base_model, torch_dtype=dtype,
     ).to(device)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
@@ -256,6 +276,7 @@ def main():
     if not datasets:
         print("No test data found. Exiting.")
         return
+    
 
     # ---- Generate + evaluate per dataset ----------------------------------
     os.makedirs(args.output_dir, exist_ok=True)
@@ -317,6 +338,45 @@ def main():
                       for k, v in dataset_metrics.items()},
         "datasets_detailed": dataset_metrics,
     }
+
+    # ---- Optional: student model (no-KD) baseline ----------------------------
+    if args.eval_student_model:
+        # Free the LoRA model before loading a second copy to avoid OOM
+        del model, base_model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif device.type == "mps":
+            torch.mps.empty_cache()
+
+        print(f"\n{'='*60}")
+        print(f"  Evaluating student model (no-KD baseline): {args.base_model}")
+        print(f"{'='*60}")
+
+        all_student_records, all_student_s_cots, all_student_t_cots, student_dataset_metrics = \
+            evaluate_student_model(args.base_model, datasets, dtype, device, args.max_new_tokens, args.tolerance)
+
+        student_total_all = sum(m["total"] for m in student_dataset_metrics.values())
+        student_correct_all = sum(m["correct"] for m in student_dataset_metrics.values())
+        student_acc = student_correct_all / student_total_all if student_total_all else 0.0
+
+        print(f"\n  Computing overall BERTScores for student model …")
+        student_overall_bs = compute_bert_scores(all_student_s_cots, all_student_t_cots, device)
+
+        metrics["student_model_baseline"] = {
+            "overall": {
+                "total": student_total_all,
+                "correct": student_correct_all,
+                "accuracy": round(student_acc, 4),
+                "bert_score": {k: v for k, v in student_overall_bs.items() if k != "per_item"},
+            },
+            "datasets": student_dataset_metrics,
+        }
+
+        student_responses_path = os.path.join(args.output_dir, "student_model_responses.jsonl")
+        with open(student_responses_path, "w") as f:
+            for rec in all_student_records:
+                f.write(json.dumps(rec) + "\n")
+        print(f"  Student model responses written to: {student_responses_path}")
 
     # ---- Write outputs ----------------------------------------------------
     responses_path = os.path.join(args.output_dir, "responses.jsonl")
